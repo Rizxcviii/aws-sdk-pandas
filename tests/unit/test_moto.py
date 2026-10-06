@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
+import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from unittest import mock
 from unittest.mock import ANY, patch
@@ -83,6 +86,16 @@ def moto_dynamodb_table(moto_dynamodb_client):
         BillingMode="PAY_PER_REQUEST",
     )
     yield table_name
+
+
+@pytest.fixture(scope="function")
+def moto_timestream_session():
+    with moto.mock_aws():
+        session = boto3.Session(region_name="us-east-1")
+        timestream_client = session.client("timestream-write")
+        timestream_client.create_database(DatabaseName="sampleDB")
+        timestream_client.create_table(DatabaseName="sampleDB", TableName="sampleTable")
+        yield session
 
 
 def get_content_md5(desc: dict):
@@ -374,6 +387,50 @@ def test_read_csv_with_chucksize_and_pandas_arguments(moto_s3_client: "S3Client"
         assert len(df.columns) == 2
 
 
+@pytest.mark.parametrize("chunksize", [None, 1])
+def test_read_csv_mixed_compression(moto_s3_client: "S3Client", chunksize: int | None) -> None:
+    df = pd.DataFrame({"id": [1, 2], "value": ["a", "b"]})
+    compressed = "s3://bucket/file1.csv.gz"
+    uncompressed = "s3://bucket/file2.csv"
+    wr.s3.to_csv(df=df, path=compressed, index=False, compression="gzip")
+    wr.s3.to_csv(df=df, path=uncompressed, index=False)
+    result = wr.s3.read_csv(path=[compressed, uncompressed], chunksize=chunksize, use_threads=False)
+    if chunksize is None:
+        assert len(result.index) == 4
+        assert list(result.columns) == ["id", "value"]
+    else:
+        chunks = list(result)
+        assert len(chunks) == 4
+        for chunk in chunks:
+            assert len(chunk.index) == 1
+            assert list(chunk.columns) == ["id", "value"]
+
+
+@pytest.mark.parametrize("chunksize", [None, 1])
+def test_read_json_mixed_compression(moto_s3_client: "S3Client", chunksize: int | None) -> None:
+    df = pd.DataFrame({"id": [1, 2], "value": ["a", "b"]})
+    compressed = "s3://bucket/file1.json.gz"
+    uncompressed = "s3://bucket/file2.json"
+    wr.s3.to_json(df=df, path=compressed, compression="gzip", orient="records", lines=True)
+    wr.s3.to_json(df=df, path=uncompressed, orient="records", lines=True)
+    result = wr.s3.read_json(
+        path=[compressed, uncompressed],
+        orient="records",
+        lines=True,
+        chunksize=chunksize,
+        use_threads=False,
+    )
+    if chunksize is None:
+        assert len(result.index) == 4
+        assert list(result.columns) == ["id", "value"]
+    else:
+        chunks = list(result)
+        assert len(chunks) == 4
+        for chunk in chunks:
+            assert len(chunk.index) == 1
+            assert list(chunk.columns) == ["id", "value"]
+
+
 @mock.patch("pandas.read_csv")
 @mock.patch("pandas.concat")
 def test_read_csv_pass_pandas_arguments_and_encoding_succeed(
@@ -453,6 +510,38 @@ def test_to_csv_valid_argument_combination_when_dataset_true_succeed(moto_s3_cli
     wr.s3.to_csv(df=get_df_csv(), path=path, index=False, dataset=True, partition_cols=["par0", "par1"])
 
     wr.s3.to_csv(df=get_df_csv(), path=path, index=False, dataset=True, mode="append")
+
+
+def test_path2list_suffix_with_list_of_paths(moto_s3_client: "S3Client") -> None:
+    paths = ["s3://bucket/file1.parquet", "s3://bucket/file2.txt", "s3://bucket/file3.csv"]
+
+    # 1. suffix only
+    result1 = wr.s3._list._path2list(
+        path=paths,
+        s3_client=moto_s3_client,
+        s3_additional_kwargs=None,
+        suffix=".parquet",
+    )
+    assert result1 == ["s3://bucket/file1.parquet"]
+
+    # 2. list of suffixes
+    result2 = wr.s3._list._path2list(
+        path=paths,
+        s3_client=moto_s3_client,
+        s3_additional_kwargs=None,
+        suffix=[".parquet", ".csv"],
+    )
+    assert result2 == ["s3://bucket/file1.parquet", "s3://bucket/file3.csv"]
+
+    # 3. suffix and ignore_suffix combined
+    result3 = wr.s3._list._path2list(
+        path=paths,
+        s3_client=moto_s3_client,
+        s3_additional_kwargs=None,
+        suffix=[".parquet", ".txt"],
+        ignore_suffix=".txt",
+    )
+    assert result3 == ["s3://bucket/file1.parquet"]
 
 
 def test_to_csv_data_empty(moto_s3_client: "S3Client") -> None:
@@ -939,6 +1028,120 @@ def test_dynamodb_read_items_max_items_evaluated_zero(moto_dynamodb_client, moto
         wr.dynamodb.read_items(table_name=moto_dynamodb_table, max_items_evaluated=-1)
 
 
+def _capture_timestream_write_records(session: boto3.Session) -> list:
+    captured: list = []
+
+    def _handler(params, **kwargs) -> None:
+        # Deep copy so that a shared mutable `CommonAttributes` cannot be observed post-hoc.
+        captured.append(copy.deepcopy(params))
+
+    session.events.register("provide-client-params.timestream-write.WriteRecords", _handler)
+    return captured
+
+
+def _timestream_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            # Timezone-aware so that the formatted epoch value does not depend on the local timezone.
+            "time": [datetime(2024, 1, 1, tzinfo=timezone.utc)],
+            "cpu": [1.0],
+            "mem": [2.0],
+        }
+    )
+
+
+def test_timestream_write_does_not_mutate_common_attributes(moto_timestream_session: boto3.Session) -> None:
+    common_attributes = {"Dimensions": [{"Name": "host", "Value": "h1", "DimensionValueType": "VARCHAR"}]}
+    expected = copy.deepcopy(common_attributes)
+
+    rejected_records = wr.timestream.write(
+        df=_timestream_df(),
+        database="sampleDB",
+        table="sampleTable",
+        time_col="time",
+        measure_col="cpu",
+        common_attributes=common_attributes,
+        boto3_session=moto_timestream_session,
+        use_threads=False,
+    )
+
+    assert rejected_records == []
+    assert common_attributes == expected
+
+
+def test_timestream_write_common_attributes_reused_across_calls(moto_timestream_session: boto3.Session) -> None:
+    captured = _capture_timestream_write_records(moto_timestream_session)
+    common_attributes = {"Dimensions": [{"Name": "host", "Value": "h1", "DimensionValueType": "VARCHAR"}]}
+
+    wr.timestream.write(
+        df=_timestream_df(),
+        database="sampleDB",
+        table="sampleTable",
+        time_col="time",
+        measure_col="cpu",
+        common_attributes=common_attributes,
+        boto3_session=moto_timestream_session,
+        use_threads=False,
+    )
+    wr.timestream.write(
+        df=_timestream_df(),
+        database="sampleDB",
+        table="sampleTable",
+        time_col="time",
+        measure_col="mem",
+        version=5,
+        time_unit="MICROSECONDS",
+        common_attributes=common_attributes,
+        boto3_session=moto_timestream_session,
+        use_threads=False,
+    )
+
+    assert len(captured) == 2
+    first, second = captured
+
+    assert first["CommonAttributes"]["MeasureName"] == "cpu"
+    assert first["CommonAttributes"]["TimeUnit"] == "MILLISECONDS"
+    assert first["CommonAttributes"]["Version"] == 1
+    assert first["Records"][0]["Time"] == "1704067200000"
+
+    # The second call must honor its own arguments instead of the defaults resolved for the first one.
+    assert second["CommonAttributes"]["MeasureName"] == "mem"
+    assert second["CommonAttributes"]["TimeUnit"] == "MICROSECONDS"
+    assert second["CommonAttributes"]["Version"] == 5
+    assert second["Records"][0]["Time"] == "1704067200000000"
+
+
+def test_timestream_write_common_attributes_take_precedence(moto_timestream_session: boto3.Session) -> None:
+    captured = _capture_timestream_write_records(moto_timestream_session)
+    common_attributes = {
+        "Dimensions": [{"Name": "host", "Value": "h1", "DimensionValueType": "VARCHAR"}],
+        "MeasureName": "from_common_attributes",
+        "TimeUnit": "SECONDS",
+        "Version": 9,
+    }
+    expected = copy.deepcopy(common_attributes)
+
+    wr.timestream.write(
+        df=_timestream_df(),
+        database="sampleDB",
+        table="sampleTable",
+        time_col="time",
+        measure_col="cpu",
+        measure_name="from_argument",
+        version=1,
+        time_unit="MILLISECONDS",
+        common_attributes=common_attributes,
+        boto3_session=moto_timestream_session,
+        use_threads=False,
+    )
+
+    assert common_attributes == expected
+    assert captured[0]["CommonAttributes"]["MeasureName"] == "from_common_attributes"
+    assert captured[0]["CommonAttributes"]["TimeUnit"] == "SECONDS"
+    assert captured[0]["CommonAttributes"]["Version"] == 9
+    assert captured[0]["Records"][0]["Time"] == "1704067200"
+
+
 def test_redshift_copy_escapes_path_literal() -> None:
     from awswrangler.redshift._write import _copy
 
@@ -970,6 +1173,45 @@ def test_secretsmanager_get_secret_string(moto_aws) -> None:
     session.client("secretsmanager").create_secret(Name="aws-sdk-pandas/string-secret", SecretString="p@ssw0rd")
 
     assert wr.secretsmanager.get_secret("aws-sdk-pandas/string-secret", boto3_session=session) == "p@ssw0rd"
+
+
+@pytest.mark.parametrize(
+    "engine, ssl_value, expect_tls",
+    [
+        ("mysql", True, True),
+        ("mysql", "true", True),
+        ("mysql", "True", True),
+        ("mysql", False, False),
+        ("mysql", "false", False),
+        ("mysql", None, False),
+        ("aurora-mysql", True, True),
+        # ssl_context is only consumed by the MySQL connector; other engines must not set it
+        ("postgresql", True, False),
+        ("sqlserver", True, False),
+    ],
+)
+def test_connection_attributes_from_secret_ssl(moto_aws, engine, ssl_value, expect_tls) -> None:
+    session = boto3.Session(region_name="us-east-1")
+    secret = {
+        "engine": engine,
+        "host": "db-instance.us-east-1.rds.amazonaws.com",
+        "username": "test",
+        "password": "test",
+        "port": "3306",
+        "dbname": "mydb",
+    }
+    if ssl_value is not None:
+        secret["ssl"] = ssl_value
+    secret_name = f"aws-sdk-pandas/db-secret-ssl-{engine}-{type(ssl_value).__name__}-{ssl_value}"
+    session.client("secretsmanager").create_secret(Name=secret_name, SecretString=json.dumps(secret))
+
+    attrs = wr._databases._get_connection_attributes_from_secrets_manager(
+        secret_id=secret_name, dbname=None, boto3_session=session
+    )
+    if expect_tls:
+        assert attrs.ssl_context is not None
+    else:
+        assert attrs.ssl_context is None
 
 
 @pytest.mark.parametrize(
